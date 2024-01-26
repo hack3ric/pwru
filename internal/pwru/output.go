@@ -5,18 +5,25 @@
 package pwru
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
-	ps "github.com/mitchellh/go-ps"
+	"github.com/jsimonetti/rtnetlink"
+	"github.com/tklauser/ps"
+	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 
 	"github.com/cilium/pwru/internal/byteorder"
 )
@@ -32,11 +39,12 @@ type output struct {
 	writer        io.Writer
 	kprobeMulti   bool
 	kfreeReasons  map[uint64]string
+	ifaceCache    map[uint64]map[uint32]string
 }
 
 func NewOutput(flags *Flags, printSkbMap *ebpf.Map, printStackMap *ebpf.Map,
-	addr2Name Addr2Name, kprobeMulti bool, btfSpec *btf.Spec) (*output, error) {
-
+	addr2Name Addr2Name, kprobeMulti bool, btfSpec *btf.Spec,
+) (*output, error) {
 	writer := os.Stdout
 
 	if flags.OutputFile != "" {
@@ -52,6 +60,14 @@ func NewOutput(flags *Flags, printSkbMap *ebpf.Map, printStackMap *ebpf.Map,
 		log.Printf("Unable to load packet drop reaons: %v", err)
 	}
 
+	var ifs map[uint64]map[uint32]string
+	if flags.OutputMeta {
+		ifs, err = getIfaces()
+		if err != nil {
+			log.Printf("Failed to retrieve all ifaces from all network namespaces: %v. Some iface names might be not shown.", err)
+		}
+	}
+
 	return &output{
 		flags:         flags,
 		lastSeenSkb:   map[uint64]uint64{},
@@ -61,6 +77,7 @@ func NewOutput(flags *Flags, printSkbMap *ebpf.Map, printStackMap *ebpf.Map,
 		writer:        writer,
 		kprobeMulti:   kprobeMulti,
 		kfreeReasons:  reasons,
+		ifaceCache:    ifs,
 	}, nil
 }
 
@@ -80,9 +97,9 @@ func (o *output) Print(event *Event) {
 		fmt.Fprintf(o.writer, "%12s ", time.Now().Format(absoluteTS))
 	}
 	p, err := ps.FindProcess(int(event.PID))
-	execName := "<empty>"
+	execName := fmt.Sprintf("<empty>(%d)", event.PID)
 	if err == nil && p != nil {
-		execName = p.Executable()
+		execName = fmt.Sprintf("%s(%d)", p.ExecutablePath(), event.PID)
 	}
 	ts := event.Timestamp
 	if o.flags.OutputTS == "relative" {
@@ -115,6 +132,16 @@ func (o *output) Print(event *Event) {
 		funcName = fmt.Sprintf("0x%x", addr)
 	}
 
+	if strings.HasPrefix(funcName, "bpf_prog_") && strings.HasSuffix(funcName, "[bpf]") {
+		// The name of bpf prog is "bpf_prog_<id>_<name>  [bpf]". We want to
+		// print only the name.
+		items := strings.Split(funcName, "_")
+		if len(items) > 3 {
+			funcName = strings.Join(items[3:], "_")
+			funcName = strings.TrimSpace(funcName[:len(funcName)-5])
+		}
+	}
+
 	outFuncName := funcName
 	if funcName == "kfree_skb_reason" {
 		if reason, ok := o.kfreeReasons[event.ParamSecond]; ok {
@@ -124,7 +151,7 @@ func (o *output) Print(event *Event) {
 		}
 	}
 
-	fmt.Fprintf(o.writer, "%18s %6s %16s %24s", fmt.Sprintf("0x%x", event.SAddr),
+	fmt.Fprintf(o.writer, "%18s %6s %16s %24s", fmt.Sprintf("%#x", event.SAddr),
 		fmt.Sprintf("%d", event.CPU), fmt.Sprintf("[%s]", execName), outFuncName)
 	if o.flags.OutputTS != "none" {
 		fmt.Fprintf(o.writer, " %16d", ts)
@@ -132,7 +159,10 @@ func (o *output) Print(event *Event) {
 	o.lastSeenSkb[event.SAddr] = event.Timestamp
 
 	if o.flags.OutputMeta {
-		fmt.Fprintf(o.writer, " netns=%d mark=0x%x ifindex=%d proto=%x mtu=%d len=%d", event.Meta.Netns, event.Meta.Mark, event.Meta.Ifindex, event.Meta.Proto, event.Meta.MTU, event.Meta.Len)
+		fmt.Fprintf(o.writer, " netns=%d mark=%#x iface=%s proto=%#04x mtu=%d len=%d",
+			event.Meta.Netns, event.Meta.Mark,
+			o.getIfaceName(event.Meta.Netns, event.Meta.Ifindex),
+			byteorder.NetworkToHost16(event.Meta.Proto), event.Meta.MTU, event.Meta.Len)
 	}
 
 	if o.flags.OutputTuple {
@@ -163,6 +193,15 @@ func (o *output) Print(event *Event) {
 	}
 
 	fmt.Fprintln(o.writer)
+}
+
+func (o *output) getIfaceName(netnsInode, ifindex uint32) string {
+	if ifaces, ok := o.ifaceCache[uint64(netnsInode)]; ok {
+		if name, ok := ifaces[ifindex]; ok {
+			return fmt.Sprintf("%d(%s)", ifindex, name)
+		}
+	}
+	return fmt.Sprintf("%d", ifindex)
 }
 
 func protoToStr(proto uint8) string {
@@ -207,8 +246,98 @@ func getKFreeSKBReasons(spec *btf.Spec) (map[uint64]string, error) {
 	ret := map[uint64]string{}
 	for _, val := range dropReasonsEnum.Values {
 		ret[uint64(val.Value)] = val.Name
-
 	}
 
 	return ret, nil
+}
+
+func getIfaces() (map[uint64]map[uint32]string, error) {
+	var err error
+	procPath := "/proc"
+
+	ifaceCache := make(map[uint64]map[uint32]string)
+
+	dirs, err := os.ReadDir(procPath)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+
+		// skip non-process dirs
+		if _, err := strconv.Atoi(d.Name()); err != nil {
+			continue
+		}
+
+		// get inode of netns
+		path := filepath.Join(procPath, d.Name(), "ns", "net")
+		fd, err0 := os.Open(path)
+		if err0 != nil {
+			err = errors.Join(err, err0)
+			continue
+		}
+		var stat unix.Stat_t
+		if err0 := unix.Fstat(int(fd.Fd()), &stat); err0 != nil {
+			err = errors.Join(err, err0)
+			continue
+		}
+		inode := stat.Ino
+
+		if _, exists := ifaceCache[inode]; exists {
+			continue // we already checked that netns
+		}
+
+		ifaces, err0 := getIfacesInNetNs(path)
+		if err0 != nil {
+			err = errors.Join(err, err0)
+			continue
+		}
+
+		ifaceCache[inode] = ifaces
+
+	}
+
+	return ifaceCache, err
+}
+
+func getIfacesInNetNs(path string) (map[uint32]string, error) {
+	current, err := netns.Get()
+	if err != nil {
+		return nil, err
+	}
+
+	remote, err := netns.GetFromPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := netns.Set(remote); err != nil {
+		return nil, err
+	}
+
+	defer netns.Set(current)
+
+	conn, err := rtnetlink.Dial(nil)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	msg, err := conn.Link.List()
+	if err != nil {
+		return nil, err
+	}
+
+	ifaces := make(map[uint32]string)
+	for _, link := range msg {
+		ifaces[link.Index] = link.Attributes.Name
+	}
+
+	return ifaces, nil
 }

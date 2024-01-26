@@ -55,9 +55,12 @@ func GetFuncs(pattern string, spec *btf.Spec, kmods []string, kprobeMulti bool) 
 		return nil, fmt.Errorf("failed to compile regular expression %v", err)
 	}
 
-	availableFuncs, err := getAvailableFilterFunctions()
-	if err != nil {
-		log.Printf("Failed to retrieve available ftrace functions (is /sys/kernel/debug/tracing mounted?): %s", err)
+	var availableFuncs map[string]struct{}
+	if kprobeMulti {
+		availableFuncs, err = getAvailableFilterFunctions()
+		if err != nil {
+			log.Printf("Failed to retrieve available ftrace functions (is /sys/kernel/debug/tracing mounted?): %s", err)
+		}
 	}
 
 	iters := []iterator{{"", spec.Iterate()}}
@@ -90,12 +93,14 @@ func GetFuncs(pattern string, spec *btf.Spec, kmods []string, kprobeMulti bool) 
 				continue
 			}
 
-			availableFnName := fnName
-			if it.kmod != "" {
-				availableFnName = fmt.Sprintf("%s [%s]", fnName, it.kmod)
-			}
-			if _, ok := availableFuncs[availableFnName]; !ok {
-				continue
+			if kprobeMulti {
+				availableFnName := fnName
+				if it.kmod != "" {
+					availableFnName = fmt.Sprintf("%s [%s]", fnName, it.kmod)
+				}
+				if _, ok := availableFuncs[availableFnName]; !ok {
+					continue
+				}
 			}
 
 			fnProto := fn.Type.(*btf.FuncProto)
@@ -154,4 +159,38 @@ func HaveBPFLinkKprobeMulti() bool {
 	defer link.Close()
 
 	return true
+}
+
+// Very hacky way to check whether tracing link is supported.
+func HaveBPFLinkTracing() bool {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Name: "fexit_skb_clone",
+		Type: ebpf.Tracing,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		AttachType: ebpf.AttachTraceFExit,
+		AttachTo:   "skb_clone",
+		License:    "MIT",
+	})
+	if err != nil {
+		return false
+	}
+	defer prog.Close()
+
+	link, err := link.AttachTracing(link.TracingOptions{
+		Program: prog,
+	})
+	if err != nil {
+		return false
+	}
+	defer link.Close()
+
+	return true
+}
+
+func HaveAvailableFilterFunctions() bool {
+	_, err := getAvailableFilterFunctions()
+	return err == nil
 }

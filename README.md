@@ -1,5 +1,8 @@
 # pwru (packet, where are you?)
 
+[![Build and Test](https://github.com/cilium/pwru/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cilium/pwru/actions/workflows/test.yml)
+[![GitHub Release](https://img.shields.io/github/release/cilium/pwru.svg?style=flat)](https://github.com/cilium/pwru/releases/latest)
+
 ![logo](logo.png "Detective Gopher is looking for packet traces left by eBPF bee")
 
 `pwru` is an [eBPF](https://ebpf.io)-based tool for tracing network packets in
@@ -47,14 +50,17 @@ You can download the statically linked executable for x86\_64 and arm64 from the
 ```
 $ ./pwru --help
 Usage: pwru [options] [pcap-filter]
-    Availble pcap-filter: see "man 7 pcap-filter"
-    Availble options:
+    Available pcap-filter: see "man 7 pcap-filter"
+    Available options:
       --all-kmods                 attach to all available kernel modules
       --backend string            Tracing backend('kprobe', 'kprobe-multi'). Will auto-detect if not specified.
       --filter-func string        filter kernel functions to be probed by name (exact match, supports RE2 regular expression)
+      --filter-ifname string      filter skb ifname in --filter-netns (if not specified, use current netns)
       --filter-mark uint32        filter skb mark
-      --filter-netns uint32       filter netns inode
+      --filter-netns string       filter netns ("/proc/<pid>/ns/net", "inode:<inode>")
+      --filter-trace-tc           trace TC bpf progs
       --filter-track-skb          trace a packet even if it does not match given filters (e.g., after NAT or tunnel decapsulation)
+  -h, --help                      display this message and exit
       --kernel-btf string         specify kernel BTF file
       --kmods strings             list of kernel modules names to attach to
       --output-file string        write traces to file
@@ -65,7 +71,6 @@ Usage: pwru [options] [pcap-filter]
       --output-tuple              print L4 tuple
       --timestamp string          print timestamp per skb ("current", "relative", "absolute", "none") (default "none")
       --version                   show pwru version and exit
-
 ```
 
 The `--filter-func` switch does an exact match on function names i.e.
@@ -86,8 +91,11 @@ docker run --privileged --rm -t --pid=host -v /sys/kernel/debug/:/sys/kernel/deb
 
 The following example shows how to run `pwru` on a given node:
 ```
+#!/usr/bin/env bash
 NODE=kind-control-plane
 PWRU_ARGS="--output-tuple 'host 1.1.1.1'"
+
+trap " kubectl delete --wait=false pod pwru " EXIT
 
 kubectl apply -f - <<EOF
 apiVersion: v1
@@ -116,8 +124,8 @@ spec:
   hostPID: true
 EOF
 
+kubectl wait pod pwru --for condition=Ready --timeout=90s
 kubectl logs -f pwru
-kubectl delete pod pwru
 ```
 
 ### Running on Vagrant
@@ -130,6 +138,8 @@ See [docs/vagrant.md](docs/vagrant.md)
 
 * Go >= 1.16
 * LLVM/clang >= 1.12
+* Bison 
+* Lex/Flex >= 2.5.31
 
 ### Building
 

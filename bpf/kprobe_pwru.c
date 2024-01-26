@@ -2,14 +2,6 @@
 /* Copyright Martynas Pumputis */
 /* Copyright Authors of Cilium */
 
-/*
- * WARNING: `bpf_printk()` has special intention in this program: it is used for
- * pcap-filter ebpf injection, please see the comment in the `filter_pcap()`. So
- * if you want to add additional `bpf_printk()` for debugging, it is likely to
- * break the injection and fail the bpf verifier. In this case, it is
- * recommended to use perf_output for debugging.
- */
-
 #include "vmlinux.h"
 #include "bpf/bpf_helpers.h"
 #include "bpf/bpf_core_read.h"
@@ -85,7 +77,7 @@ struct {
 struct config {
 	u32 netns;
 	u32 mark;
-	u8 output_timestamp;
+	u32 ifindex;
 	u8 output_meta;
 	u8 output_tuple;
 	u8 output_skb;
@@ -114,7 +106,6 @@ struct {
 } print_skb_map SEC(".maps");
 #endif
 
-
 static __always_inline u32
 get_netns(struct sk_buff *skb) {
 	u32 netns = BPF_CORE_READ(skb, dev, nd_net.net, ns.inum);
@@ -138,31 +129,47 @@ filter_meta(struct sk_buff *skb) {
 	if (cfg->mark && BPF_CORE_READ(skb, mark) != cfg->mark) {
 		return false;
 	}
+	if (cfg->ifindex != 0 && BPF_CORE_READ(skb, dev, ifindex) != cfg->ifindex) {
+		return false;
+	}
 	return true;
+}
+
+static __noinline bool
+filter_pcap_ebpf_l3(void *_skb, void *__skb, void *___skb, void *data, void* data_end)
+{
+	return data != data_end && _skb == __skb && __skb == ___skb;
+}
+
+static __always_inline bool
+filter_pcap_l3(struct sk_buff *skb)
+{
+	void *skb_head = BPF_CORE_READ(skb, head);
+	void *data = skb_head + BPF_CORE_READ(skb, network_header);
+	void *data_end = skb_head + BPF_CORE_READ(skb, tail);
+	return filter_pcap_ebpf_l3((void *)skb, (void *)skb, (void *)skb, data, data_end);
+}
+
+static __noinline bool
+filter_pcap_ebpf_l2(void *_skb, void *__skb, void *___skb, void *data, void* data_end)
+{
+	return data != data_end && _skb == __skb && __skb == ___skb;
+}
+
+static __always_inline bool
+filter_pcap_l2(struct sk_buff *skb)
+{
+	void *skb_head = BPF_CORE_READ(skb, head);
+	void *data = skb_head + BPF_CORE_READ(skb, mac_header);
+	void *data_end = skb_head + BPF_CORE_READ(skb, tail);
+	return filter_pcap_ebpf_l2((void *)skb, (void *)skb, (void *)skb, data, data_end);
 }
 
 static __always_inline bool
 filter_pcap(struct sk_buff *skb) {
-	BPF_CORE_READ(skb, head);
-	void *skb_head = BPF_CORE_READ(skb, head);
-	u16 l3_off = BPF_CORE_READ(skb, network_header);
-	void *data = skb_head + l3_off;
-	u16 l4_off = BPF_CORE_READ(skb, transport_header);
-	u16 len = BPF_CORE_READ(skb, len);
-	void *data_end = skb_head + l4_off + len;
-	/*
-	 * The next two lines of code won't be executed; they will be replaced
-	 * by ebpf instructions compiled from pcap-filter expression before
-	 * loading to kernel.
-	 * However they are important placeholders to:
-	 * 1. let us know the registers holding data and data_end, which are
-	 * needed to convert cbpf to ebpf;
-	 * 2. leave r0, r1, r2, r3, r4 available for pcap filter ebpf
-	 * instructions;
-	 * 3. mark the position to inject pcap filter ebpf instructions;
-	 */
-	bpf_printk("%d %d", data, data_end);
-	return data < data_end;
+	if (BPF_CORE_READ(skb, mac_len) == 0)
+		return filter_pcap_l3(skb);
+	return filter_pcap_l2(skb);
 }
 
 static __always_inline bool
@@ -242,7 +249,7 @@ set_skb_btf(struct sk_buff *skb, typeof(print_skb_id) *event_id) {
 }
 
 static __always_inline void
-set_output(struct pt_regs *ctx, struct sk_buff *skb, struct event_t *event) {
+set_output(void *ctx, struct sk_buff *skb, struct event_t *event) {
 	if (cfg->output_meta) {
 		set_meta(skb, &event->meta);
 	}
@@ -260,9 +267,8 @@ set_output(struct pt_regs *ctx, struct sk_buff *skb, struct event_t *event) {
 	}
 }
 
-static __noinline int
-handle_everything(struct sk_buff *skb, struct pt_regs *ctx, bool has_get_func_ip) {
-	struct event_t event = {};
+static __noinline bool
+handle_everything(struct sk_buff *skb, void *ctx, struct event_t *event) {
 	bool tracked = false;
 	u64 skb_addr = (u64) skb;
 
@@ -273,27 +279,37 @@ handle_everything(struct sk_buff *skb, struct pt_regs *ctx, bool has_get_func_ip
 		}
 
 		if (!filter(skb)) {
-			return 0;
+			return false;
 		}
 
 cont:
-		set_output(ctx, skb, &event);
+		set_output(ctx, skb, event);
 	}
 
 	if (cfg->track_skb && !tracked) {
 		bpf_map_update_elem(&skb_addresses, &skb_addr, &TRUE, BPF_ANY);
 	}
 
-	event.skb_addr = (u64) skb;
-	event.pid = bpf_get_current_pid_tgid();
-	event.addr = has_get_func_ip ? bpf_get_func_ip(ctx) : PT_REGS_IP(ctx);
-	event.ts = bpf_ktime_get_ns();
-	event.cpu_id = bpf_get_smp_processor_id();
-	event.param_second = PT_REGS_PARM2(ctx);
+	event->pid = bpf_get_current_pid_tgid() >> 32;
+	event->ts = bpf_ktime_get_ns();
+	event->cpu_id = bpf_get_smp_processor_id();
 
+	return true;
+}
+
+static __always_inline int
+kprobe_skb(struct sk_buff *skb, struct pt_regs *ctx, bool has_get_func_ip) {
+	struct event_t event = {};
+
+	if (!handle_everything(skb, ctx, &event))
+		return BPF_OK;
+
+	event.skb_addr = (u64) skb;
+	event.addr = has_get_func_ip ? bpf_get_func_ip(ctx) : PT_REGS_IP(ctx);
+	event.param_second = PT_REGS_PARM2(ctx);
 	bpf_map_push_elem(&events, &event, BPF_EXIST);
 
-	return 0;
+	return BPF_OK;
 }
 
 #ifdef HAS_KPROBE_MULTI
@@ -308,7 +324,7 @@ cont:
   SEC(PWRU_KPROBE_TYPE "/skb-" #X)                                             \
   int kprobe_skb_##X(struct pt_regs *ctx) {                                    \
     struct sk_buff *skb = (struct sk_buff *) PT_REGS_PARM##X(ctx);             \
-    return handle_everything(skb, ctx, PWRU_HAS_GET_FUNC_IP);                  \
+    return kprobe_skb(skb, ctx, PWRU_HAS_GET_FUNC_IP);                         \
   }
 
 PWRU_ADD_KPROBE(1)
@@ -320,5 +336,46 @@ PWRU_ADD_KPROBE(5)
 #undef PWRU_KPROBE
 #undef PWRU_HAS_GET_FUNC_IP
 #undef PWRU_KPROBE_TYPE
+
+SEC("kprobe/skb_lifetime_termination")
+int kprobe_skb_lifetime_termination(struct pt_regs *ctx) {
+	u64 skb = (u64) PT_REGS_PARM1(ctx);
+
+	bpf_map_delete_elem(&skb_addresses, &skb);
+
+	return BPF_OK;
+}
+
+static __always_inline int
+track_skb_clone(u64 old, u64 new) {
+	if (bpf_map_lookup_elem(&skb_addresses, &old))
+		bpf_map_update_elem(&skb_addresses, &new, &TRUE, BPF_ANY);
+
+	return BPF_OK;
+}
+
+SEC("fexit/skb_clone")
+int BPF_PROG(fexit_skb_clone, u64 old, gfp_t mask, u64 new) {
+	return track_skb_clone(old, new);
+}
+
+SEC("fexit/skb_copy")
+int BPF_PROG(fexit_skb_copy, u64 old, gfp_t mask, u64 new) {
+	return track_skb_clone(old, new);
+}
+
+SEC("fentry/tc")
+int BPF_PROG(fentry_tc, struct sk_buff *skb) {
+	struct event_t event = {};
+
+	if (!handle_everything(skb, ctx, &event))
+		return BPF_OK;
+
+	event.skb_addr = (u64) skb;
+	event.addr = bpf_get_func_ip(ctx);
+	bpf_map_push_elem(&events, &event, BPF_EXIST);
+
+	return BPF_OK;
+}
 
 char __license[] SEC("license") = "Dual BSD/GPL";

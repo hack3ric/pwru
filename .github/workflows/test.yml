@@ -11,12 +11,12 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
 
     - name: Set up Go
-      uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753
+      uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491
       with:
-        go-version: 1.20.5
+        go-version: 1.21.5
 
     - name: Check module vendoring
       run: |
@@ -25,26 +25,13 @@ jobs:
         go mod verify
         test -z "$(git status --porcelain)" || (echo "please run 'go mod tidy && go mod vendor', and submit your changes"; exit 1)
 
-    - name: Cache LLVM and Clang
-      id: cache-llvm
-      uses: actions/cache@88522ab9f39a2ea568f7027eddc7d8d8bc9d59c8
-      with:
-        path: $HOME/.clang
-        key: llvm-12.0
-
-    - name: Install LLVM and Clang
-      uses: KyleMayes/install-llvm-action@c135b3937686fd69c2651507aabc9925a8f9eee8
-      with:
-        ubuntu-version: "22.04"
-        version: "12.0.0"
-        directory: $HOME/.clang
-        cached: ${{ steps.cache-llvm.outputs.cache-hit }}
-
     - name: Generate and build
-      run: make pwru
+      run: |
+        make release
+        tar xfv release/pwru-linux-amd64.tar.gz
 
     - name: Store executable
-      uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+      uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392
       with:
         name: pwru
         path: pwru
@@ -59,62 +46,126 @@ jobs:
         kernel: [ '5.4-v0.3', '5.15-v0.3', '6.3-main', 'bpf-next-main' ]
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
 
       - name: Retrieve stored pwru executable
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@6b208ae046db98c579e8a3aa621ab581ff575935
         with:
           name: pwru
           path: pwru
 
-      - name: Run tests
-        uses: cilium/little-vm-helper@908ab1ff8a596a03cd5221a1f8602dc44c3f906d
+      - name: Provision LVH VMs
+        uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
         with:
           test-name: pwru-test
           image-version: ${{ matrix.kernel }}
-          install-dependencies: 'true'
-          dns-resolver: '1.1.1.1'
           host-mount: ./
+          dns-resolver: '1.1.1.1'
+          install-dependencies: 'true'
           cmd: |
-            set -x
-
             chmod +x /host/pwru/pwru
 
-            # Block traffic to both endpoints, so that we can see kfree_skb*
-            # in traces (test assertion)
+      - name: Test basic IPv4
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: basic-ipv4
+          pwru-pcap-filter: 'dst host 1.0.0.1 and port 8080'
+          pwru-flags: --backend=kprobe
+          traffic-setup: |
             iptables -I OUTPUT 1 -m tcp --proto tcp --dst 1.0.0.1/32 --dport 8080 -j DROP
+            curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://1.0.0.1:8080 || true
+          expected-output-pattern: '(kfree_skb_reason|kfree_skb\b).*1.0.0.1:8080'
+
+      - name: Test basic IPv6
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: basic-ipv6
+          pwru-pcap-filter: 'dst host 2606:4700:4700::1001 and port 8080'
+          pwru-flags: --backend=kprobe
+          traffic-setup: |
             ip6tables -I OUTPUT 1 -m tcp --proto tcp --dst 2606:4700:4700::1001 --dport 8080 -j DROP
+            curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://[2606:4700:4700::1001]:8080 || true
+          expected-output-pattern: '(kfree_skb_reason|kfree_skb\b).*\[2606:4700:4700::1001\]:8080'
 
-            i=0
-            for addr in '1.0.0.1' '2606:4700:4700::1001'; do
-              i=\$((i+1))
-              port=8080
-              /host/pwru/pwru --output-tuple \
-                --output-file=/tmp/pwru-\$i.log \
-                --ready-file=/tmp/pwru-\$i.ready \
-                "dst host \$addr and port \$port" 2>/tmp/pwru-\$i.status &
-              PWRU_PID=\$!
+      - name: Test advanced IPv4
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: advanced-ipv4
+          pwru-pcap-filter: 'tcp[tcpflags] = tcp-syn'
+          pwru-flags: --backend=kprobe
+          traffic-setup: |
+            iptables -I OUTPUT 1 -m tcp --proto tcp --dst 1.0.0.2/32 --dport 8080 -j DROP
+            curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://1.0.0.2:8080 || true
+          expected-output-pattern: '(kfree_skb_reason|kfree_skb\b).*1.0.0.2:8080'
 
-              while [ ! -f /tmp/pwru-\$i.ready ]; do sleep 1; done
+      - name: Test advanced IPv6
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: advanced-ipv6
+          pwru-pcap-filter: 'ip6[53] & 0x3f = 0x2'
+          pwru-flags: --backend=kprobe
+          traffic-setup: |
+            ip6tables -I OUTPUT 1 -m tcp --proto tcp --dst 2606:4700:4700::1002 --dport 8080 -j DROP
+            curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://[2606:4700:4700::1002]:8080 || true
+          expected-output-pattern: '(kfree_skb_reason|kfree_skb\b).*\[2606:4700:4700::1002\]:8080'
 
-              url=\$addr
-              if \$(echo \$addr | grep -q ':'); then url="[\$addr]"; fi
-              echo \$url
+      - name: Test pcap filter using stack
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: pcap-filter-stack
+          pwru-pcap-filter: '(((ip[2:2] - ((ip[0]&0xf)<<2)) - ((tcp[12]&0xf0)>>2)) != 0)'
+          pwru-flags: --backend=kprobe
+          traffic-setup: curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://1.1.1.1 || true
+          expected-output-pattern: '1.1.1.1:80'
 
-              curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://\$url:\$port || true
+      - name: Test --filter-track-skb
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: filter-track-skb
+          pwru-flags: --filter-track-skb --backend=kprobe
+          pwru-pcap-filter: dst host 10.10.20.99
+          traffic-setup: |
+            iptables -t nat -I OUTPUT 1 -d 10.10.20.99/32 -j DNAT --to-destination 10.10.14.2
+            curl -vvv -sS --fail --connect-timeout "1" -o /dev/null http://10.10.20.99:80 || true
+          expected-output-pattern: '10.10.14.2:80'
 
-              kill \$PWRU_PID
-              wait \$PWRU_PID
+      - name: Test ARP filter
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: filter-arp
+          pwru-pcap-filter: 'arp and arp[7] = 1 and arp[24]= 169 and arp[25] = 254 and arp[26] = 0 and arp[27] = 1'
+          pwru-flags: --backend=kprobe
+          traffic-setup: |
+            ip net a pwru
+            ip l a pwru-veth type veth peer name pwru-veth-peer
+            ip l s pwru-veth-peer up
+            ip l s pwru-veth netns pwru
+            ip net e pwru ip l s pwru-veth up
+            ip r a 10.0.0.1 dev pwru-veth-peer
+            ip net e pwru ip a a 10.0.0.1 dev pwru-veth
+            ip net e pwru ip r a 169.254.0.1 dev pwru-veth
+            ip net e pwru ip r a default via 169.254.0.1 dev pwru-veth
 
-              grep "kfree_skb" /tmp/pwru-\$i.log | grep -F "\${url}:\${port}"
-            done
+            ping -W1 -c1 10.0.0.1 || true
+          expected-output-pattern: 'arp_rcv'
+
+      - name: Test --filter-ifname
+        uses: ./.github/actions/pwru-test
+        with:
+          test-name: filter-ifname
+          pwru-flags: --filter-ifname lo --backend=kprobe
+          pwru-pcap-filter: icmp
+          traffic-setup: |
+            ping -W1 -c1 127.0.0.1 || true
+          expected-output-pattern: 'icmp'
 
       - name: Fetch artifacts
         if: ${{ !success() }}
-        uses: cilium/little-vm-helper@908ab1ff8a596a03cd5221a1f8602dc44c3f906d
+        uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a
         with:
           provision: 'false'
           cmd: |
-            cat /tmp/pwru-*.status || true
-            cat /tmp/pwru-*.ready || true
-            cat /tmp/pwru-*.log || true
+            for i in /tmp/pwru-*.status /tmp/pwru-*.ready /tmp/pwru-*.log; do
+              echo "--- \$i ---"
+              cat \$i || true
+            done

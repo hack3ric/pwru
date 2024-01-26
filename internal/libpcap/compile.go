@@ -25,20 +25,28 @@ const (
 	MAXIMUM_SNAPLEN          = 262144
 )
 
-func CompileCbpf(expr string) (insts []bpf.Instruction, err error) {
+type StackOffset int
+
+const (
+	BpfReadKernelOffset StackOffset = -8*(iota+1) - 80
+	R1Offset
+	R2Offset
+	R3Offset
+	R4Offset
+	R5Offset
+	AvailableOffset
+)
+
+func CompileCbpf(expr string, l3 bool) (insts []bpf.Instruction, err error) {
 	if len(expr) == 0 {
 		return
 	}
 
-	/*
-		DLT_RAW linktype tells pcap_compile() to generate cbpf instructions for
-		skb without link layer. This is because kernel doesn't supply L2 data
-		for many of functions, where skb->mac_len == 0, while the default
-		pcap_compile mode only works for a complete frame data, so we have to
-		specify this linktype to tell pcap that the data starts from L3 network
-		header.
-	*/
-	pcap := C.pcap_open_dead(C.DLT_RAW, MAXIMUM_SNAPLEN)
+	pcapType := C.DLT_EN10MB
+	if l3 {
+		pcapType = C.DLT_RAW
+	}
+	pcap := C.pcap_open_dead(C.int(pcapType), MAXIMUM_SNAPLEN)
 	if pcap == nil {
 		return nil, fmt.Errorf("failed to pcap_open_dead: %+v\n", C.PCAP_ERROR)
 	}
@@ -49,7 +57,7 @@ func CompileCbpf(expr string) (insts []bpf.Instruction, err error) {
 
 	var bpfProg pcapBpfProgram
 	if C.pcap_compile(pcap, (*C.struct_bpf_program)(&bpfProg), cexpr, 1, C.PCAP_NETMASK_UNKNOWN) < 0 {
-		return nil, fmt.Errorf("failed to pcap_compile '%s': %+v", expr, C.GoString(C.pcap_geterr(pcap)))
+		return nil, fmt.Errorf("failed to pcap_compile '%s': %+v (l3=%+v)", expr, C.GoString(C.pcap_geterr(pcap)), l3)
 	}
 	defer C.pcap_freecode((*C.struct_bpf_program)(&bpfProg))
 
@@ -75,8 +83,8 @@ end of the packet data. As we mentioned in the comment of DLT_RAW,
 packet data starts from L3 network header, rather than L2 ethernet
 header, caller should make sure to pass the correct arguments.
 */
-func CompileEbpf(expr string, opts cbpfc.EBPFOpts) (insts asm.Instructions, err error) {
-	cbpfInsts, err := CompileCbpf(expr)
+func CompileEbpf(expr string, opts cbpfc.EBPFOpts, l3 bool) (insts asm.Instructions, err error) {
+	cbpfInsts, err := CompileCbpf(expr, l3)
 	if err != nil {
 		return
 	}
@@ -91,23 +99,21 @@ func CompileEbpf(expr string, opts cbpfc.EBPFOpts) (insts asm.Instructions, err 
 
 /*
 We have to adjust the ebpf instructions because verifier prevents us from
-directly loading data from memory. For example, the instruction "r0 = *(u8 *)(r9 +0)"
-will break verifier with error "R9 invalid mem access 'scalar", we therefore
+directly loading data from memory. For example, the instruction "r0 = *(u8 *)(r4 +0)"
+will break verifier with error "R4 invalid mem access 'scalar", we therefore
 need to convert this direct memory load to bpf_probe_read_kernel function call:
 
 - r1 = r10  // r10 is stack top
 - r1 += -8  // r1 = r10-8
 - r2 = 1    // r2 = sizeof(u8)
-- r3 = r9   // r9 is start of packet data, aka L3 header
-- r3 += 0   // r3 = r9+0
-- call bpf_probe_read_kernel  // *(r10-8) = *(u8 *)(r9+0)
+- r3 = r4   // r4 is start of packet data, aka L3 header
+- r3 += 0   // r3 = r4+0
+- call bpf_probe_read_kernel  // *(r10-8) = *(u8 *)(r4+0)
 - r0 = *(u8 *)(r10 -8)  // r0 = *(r10-8)
 
 To safely borrow R1, R2 and R3 for setting up the arguments for
 bpf_probe_read_kernel(), we need to save the original values of R1, R2 and R3
 on stack, and restore them after the function call.
-
-More details in the comments below.
 */
 func adjustEbpf(insts asm.Instructions, opts cbpfc.EBPFOpts) (newInsts asm.Instructions, err error) {
 	replaceIdx := []int{}
@@ -117,47 +123,32 @@ func adjustEbpf(insts asm.Instructions, opts cbpfc.EBPFOpts) (newInsts asm.Instr
 			replaceIdx = append(replaceIdx, idx)
 			replaceInsts[idx] = append(replaceInsts[idx],
 
-				/*
-				   Store R1, R2, R3 on stack. Offsets -16, -24,
-				   -32 are used to store R1, R2, R3
-				   respectively, we consider these stack area
-				   safe to write for now, because:
-
-				   1. bpf_probe_read_kernel uses offset -8 as
-				   R1, our choice of -16, -24, and -32 doesn't
-				   overlap that;
-
-				   2. [r10-32, r10] stack area has been
-				   initialized by "struct event_t event = {}"
-				   in the very first of handle_everything(),
-				   with nothing set on that so far, so we can
-				   borrow this stack temporarily.
-				*/
-				asm.StoreMem(asm.RFP, -16, asm.R1, asm.DWord),
-				asm.StoreMem(asm.RFP, -24, asm.R2, asm.DWord),
-				asm.StoreMem(asm.RFP, -32, asm.R3, asm.DWord),
+				// Store R1, R2, R3 on stack.
+				asm.StoreMem(asm.RFP, int16(R1Offset), asm.R1, asm.DWord),
+				asm.StoreMem(asm.RFP, int16(R2Offset), asm.R2, asm.DWord),
+				asm.StoreMem(asm.RFP, int16(R3Offset), asm.R3, asm.DWord),
 
 				// bpf_probe_read_kernel(RFP-8, size, inst.Src)
 				asm.Mov.Reg(asm.R1, asm.RFP),
-				asm.Add.Imm(asm.R1, -8),
+				asm.Add.Imm(asm.R1, int32(BpfReadKernelOffset)),
 				asm.Mov.Imm(asm.R2, int32(inst.OpCode.Size().Sizeof())),
 				asm.Mov.Reg(asm.R3, inst.Src),
 				asm.Add.Imm(asm.R3, int32(inst.Offset)),
 				asm.FnProbeReadKernel.Call(),
 
 				// inst.Dst = *(RFP-8)
-				asm.LoadMem(inst.Dst, asm.RFP, -8, inst.OpCode.Size()),
+				asm.LoadMem(inst.Dst, asm.RFP, int16(BpfReadKernelOffset), inst.OpCode.Size()),
+
+				// Restore R4, R5 from stack. This is needed because bpf_probe_read_kernel always resets R4 and R5 even if they are not used by bpf_probe_read_kernel.
+				asm.LoadMem(asm.R4, asm.RFP, int16(R4Offset), asm.DWord),
+				asm.LoadMem(asm.R5, asm.RFP, int16(R5Offset), asm.DWord),
 			)
 
-			/*
-			 Restore R1, R2, R3 from stack, special handling when
-			 inst.Dst is R1, R2 or R3, as we don't want to overwrite
-			 its value by mistake.
-			*/
+			// Restore R1, R2, R3 from stack
 			restoreInsts := asm.Instructions{
-				asm.LoadMem(asm.R1, asm.RFP, -16, asm.DWord),
-				asm.LoadMem(asm.R2, asm.RFP, -24, asm.DWord),
-				asm.LoadMem(asm.R3, asm.RFP, -32, asm.DWord),
+				asm.LoadMem(asm.R1, asm.RFP, int16(R1Offset), asm.DWord),
+				asm.LoadMem(asm.R2, asm.RFP, int16(R2Offset), asm.DWord),
+				asm.LoadMem(asm.R3, asm.RFP, int16(R3Offset), asm.DWord),
 			}
 			switch inst.Dst {
 			case asm.R1, asm.R2, asm.R3:
@@ -181,22 +172,18 @@ func adjustEbpf(insts asm.Instructions, opts cbpfc.EBPFOpts) (newInsts asm.Instr
 		insts = append(insts[:idx], append(replaceInsts[idx], insts[idx+1:]...)...)
 	}
 
-	/*
-	 Prepend instructions to init R1, R2, R3 so as to avoid verifier error:
-	 permission denied: *(u64 *)(r10 -24) = r2: R2 !read_ok
-	*/
+	// Store R4, R5 on stack.
 	insts = append([]asm.Instruction{
-		asm.Mov.Imm(asm.R1, 0),
-		asm.Mov.Imm(asm.R2, 0),
-		asm.Mov.Imm(asm.R3, 0),
+		asm.StoreMem(asm.RFP, int16(R4Offset), asm.R4, asm.DWord),
+		asm.StoreMem(asm.RFP, int16(R5Offset), asm.R5, asm.DWord),
 	}, insts...)
 
-	// Append instructions to implement "exit immediately if not matched"
 	insts = append(insts,
-		asm.Mov.Imm(asm.R0, 0).WithSymbol("result"), // r0 = 0
-		asm.JNE.Imm(opts.Result, 0, "continue"),     // if %result != 0 (match): jump to continue
-		asm.Return().WithSymbol("return"),           // else return r0
-		asm.Mov.Imm(asm.R0, 0).WithSymbol("continue"),
+		asm.Mov.Imm(asm.R1, 0).WithSymbol(opts.ResultLabel), // r1 = 0 (_skb)
+		asm.Mov.Imm(asm.R2, 0),                              // r2 = 0 (__skb)
+		asm.Mov.Imm(asm.R3, 0),                              // r3 = 0 (___skb)
+		asm.Mov.Reg(asm.R4, opts.Result),                    // r4 = $result (data)
+		asm.Mov.Imm(asm.R5, 0),                              // r5 = 0 (data_end)
 	)
 
 	return insts, nil

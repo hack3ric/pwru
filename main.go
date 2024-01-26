@@ -30,14 +30,18 @@ func main() {
 	flags.SetFlags()
 	flags.Parse()
 
+	if flags.ShowHelp {
+		flags.PrintHelp()
+		os.Exit(0)
+	}
 	if flags.ShowVersion {
 		fmt.Printf("pwru %s\n", pwru.Version)
 		os.Exit(0)
 	}
 
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &unix.Rlimit{
-		Cur: 4096,
-		Max: 4096,
+		Cur: 8192,
+		Max: 8192,
 	}); err != nil {
 		log.Fatalf("failed to set temporary rlimit: %s", err)
 	}
@@ -81,7 +85,7 @@ func main() {
 	// has been backported to the stable, kprobe-multi cannot be used when attaching
 	// to kmods.
 	if flags.Backend == "" && len(flags.KMods) == 0 {
-		useKprobeMulti = pwru.HaveBPFLinkKprobeMulti()
+		useKprobeMulti = pwru.HaveBPFLinkKprobeMulti() && pwru.HaveAvailableFilterFunctions()
 	} else if flags.Backend == pwru.BackendKprobeMulti {
 		useKprobeMulti = true
 	}
@@ -93,7 +97,9 @@ func main() {
 	if len(funcs) <= 0 {
 		log.Fatalf("Cannot find a matching kernel function")
 	}
-	addr2name, err := pwru.GetAddrs(funcs, flags.OutputStack || len(flags.KMods) != 0)
+	// If --filter-trace-tc, it's to retrieve and print bpf prog's name.
+	addr2name, err := pwru.GetAddrs(funcs, flags.OutputStack ||
+		len(flags.KMods) != 0 || flags.FilterTraceTc)
 	if err != nil {
 		log.Fatalf("Failed to get function addrs: %s", err)
 	}
@@ -104,38 +110,69 @@ func main() {
 	opts.Programs.LogSize = ebpf.DefaultVerifierLogSize * 100
 
 	var bpfSpec *ebpf.CollectionSpec
-	var objs pwru.KProbeObjects
 	switch {
 	case flags.OutputSkb && useKprobeMulti:
 		bpfSpec, err = LoadKProbeMultiPWRU()
-		objs = &KProbeMultiPWRUObjects{}
 	case flags.OutputSkb:
 		bpfSpec, err = LoadKProbePWRU()
-		objs = &KProbePWRUObjects{}
 	case useKprobeMulti:
 		bpfSpec, err = LoadKProbeMultiPWRUWithoutOutputSKB()
-		objs = &KProbeMultiPWRUWithoutOutputSKBObjects{}
 	default:
 		bpfSpec, err = LoadKProbePWRUWithoutOutputSKB()
-		objs = &KProbeMultiPWRUWithoutOutputSKBObjects{}
 	}
 	if err != nil {
 		log.Fatalf("Failed to load bpf spec: %v", err)
 	}
 
 	for name, program := range bpfSpec.Programs {
-		if err = libpcap.InjectFilter(program, flags.FilterPcap); err != nil {
+		// Skip the skb-tracking ones that should not inject pcap-filter.
+		if name == "kprobe_skb_lifetime_termination" ||
+			name == "fexit_skb_clone" ||
+			name == "fexit_skb_copy" {
+			continue
+		}
+		if err = libpcap.InjectFilters(program, flags.FilterPcap); err != nil {
 			log.Fatalf("Failed to inject filter ebpf for %s: %v", name, err)
 		}
 	}
 
+	pwruConfig, err := pwru.GetConfig(&flags)
+	if err != nil {
+		log.Fatalf("Failed to get pwru config: %v", err)
+	}
 	if err := bpfSpec.RewriteConstants(map[string]interface{}{
-		"CFG": pwru.GetConfig(&flags),
+		"CFG": pwruConfig,
 	}); err != nil {
 		log.Fatalf("Failed to rewrite config: %v", err)
 	}
 
-	if err := bpfSpec.LoadAndAssign(objs, &opts); err != nil {
+	// As we know, for every fentry tracing program, there is a corresponding
+	// bpf prog spec with attaching target and attaching function. So, we can
+	// just copy the spec and keep the fentry_tc program spec only in the copied
+	// spec.
+	bpfSpecFentry := bpfSpec.Copy()
+	bpfSpecFentry.Programs = map[string]*ebpf.ProgramSpec{
+		"fentry_tc": bpfSpec.Programs["fentry_tc"],
+	}
+
+	// fentry_tc is not used in the kprobe/kprobe-multi cases. So, it should be
+	// deleted from the spec.
+	delete(bpfSpec.Programs, "fentry_tc")
+
+	// If not tracking skb, deleting the skb-tracking programs to reduce loading
+	// time.
+	if !flags.FilterTrackSkb {
+		delete(bpfSpec.Programs, "kprobe_skb_lifetime_termination")
+	}
+
+	haveFexit := pwru.HaveBPFLinkTracing()
+	if !flags.FilterTrackSkb || !haveFexit {
+		delete(bpfSpec.Programs, "fexit_skb_clone")
+		delete(bpfSpec.Programs, "fexit_skb_copy")
+	}
+
+	coll, err := ebpf.NewCollectionWithOptions(bpfSpec, opts)
+	if err != nil {
 		var (
 			ve          *ebpf.VerifierError
 			verifierLog string
@@ -146,19 +183,24 @@ func main() {
 
 		log.Fatalf("Failed to load objects: %s\n%+v", verifierLog, err)
 	}
-	defer objs.Close()
+	defer coll.Close()
 
-	kprobe1 := objs.GetKprobeSkb1()
-	kprobe2 := objs.GetKprobeSkb2()
-	kprobe3 := objs.GetKprobeSkb3()
-	kprobe4 := objs.GetKprobeSkb4()
-	kprobe5 := objs.GetKprobeSkb5()
+	kprobe1 := coll.Programs["kprobe_skb_1"]
+	kprobe2 := coll.Programs["kprobe_skb_2"]
+	kprobe3 := coll.Programs["kprobe_skb_3"]
+	kprobe4 := coll.Programs["kprobe_skb_4"]
+	kprobe5 := coll.Programs["kprobe_skb_5"]
 
-	events := objs.GetEvents()
-	printStackMap := objs.GetPrintStackMap()
-	var printSkbMap *ebpf.Map
-	if flags.OutputSkb {
-		printSkbMap = objs.(pwru.KProbeMapsWithOutputSKB).GetPrintSkbMap()
+	events := coll.Maps["events"]
+	printStackMap := coll.Maps["print_stack_map"]
+	printSkbMap := coll.Maps["print_skb_map"]
+
+	if flags.FilterTraceTc {
+		close, err := pwru.TraceTC(coll, bpfSpecFentry, &opts, flags.OutputSkb)
+		if err != nil {
+			log.Fatalf("Failed to trace TC: %v", err)
+		}
+		defer close()
 	}
 
 	var kprobes []link.Link
@@ -187,6 +229,44 @@ func main() {
 	log.Printf("Attaching kprobes (via %s)...\n", msg)
 	ignored := 0
 	bar := pb.StartNew(len(funcs))
+
+	if flags.FilterTrackSkb {
+		kp, err := link.Kprobe("kfree_skbmem", coll.Programs["kprobe_skb_lifetime_termination"], nil)
+		bar.Increment()
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				log.Fatalf("Opening kprobe kfree_skbmem: %s\n", err)
+			} else {
+				ignored += 1
+				log.Printf("Warn: kfree_skbmem not found, pwru is likely to mismatch skb due to lack of skb lifetime management\n")
+			}
+		} else {
+			kprobes = append(kprobes, kp)
+		}
+
+		if haveFexit {
+			progs := []*ebpf.Program{
+				coll.Programs["fexit_skb_clone"],
+				coll.Programs["fexit_skb_copy"],
+			}
+			for _, prog := range progs {
+				fexit, err := link.AttachTracing(link.TracingOptions{
+					Program: prog,
+				})
+				bar.Increment()
+				if err != nil {
+					if !errors.Is(err, os.ErrNotExist) {
+						log.Fatalf("Opening tracing(%s): %s\n", prog, err)
+					} else {
+						ignored += 1
+					}
+				} else {
+					kprobes = append(kprobes, fexit)
+				}
+			}
+		}
+	}
+
 	funcsByPos := pwru.GetFuncsByPos(funcs)
 	for pos, fns := range funcsByPos {
 		var fn *ebpf.Program
@@ -218,7 +298,7 @@ func main() {
 				kp, err := link.Kprobe(name, fn, nil)
 				bar.Increment()
 				if err != nil {
-					if !errors.Is(err, os.ErrNotExist) {
+					if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
 						log.Fatalf("Opening kprobe %s: %s\n", name, err)
 					} else {
 						ignored += 1
@@ -239,6 +319,10 @@ func main() {
 			kp, err := link.KprobeMulti(fn, opts)
 			bar.Add(len(fns))
 			if err != nil {
+				if errors.Is(err, syscall.EADDRNOTAVAIL) {
+					log.Fatalf("Found duplicate function name in the kernel (%s). Set --backend=kprobe to fix the loading error until https://github.com/cilium/pwru/issues/284 has been fixed",
+						err)
+				}
 				log.Fatalf("Opening kprobe-multi for pos %d: %s\n", pos, err)
 			}
 			kprobes = append(kprobes, kp)

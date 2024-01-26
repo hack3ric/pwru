@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cilium/ebpf"
 	flag "github.com/spf13/pflag"
 )
 
@@ -22,13 +21,16 @@ const (
 
 type Flags struct {
 	ShowVersion bool
+	ShowHelp    bool
 
 	KernelBTF string
 
-	FilterNetns    uint32
+	FilterNetns    string
 	FilterMark     uint32
 	FilterFunc     string
 	FilterTrackSkb bool
+	FilterTraceTc  bool
+	FilterIfname   string
 	FilterPcap     string
 
 	OutputTS         string
@@ -48,20 +50,23 @@ type Flags struct {
 }
 
 func (f *Flags) SetFlags() {
+	flag.BoolVarP(&f.ShowHelp, "help", "h", false, "display this message and exit")
 	flag.BoolVar(&f.ShowVersion, "version", false, "show pwru version and exit")
 	flag.StringVar(&f.KernelBTF, "kernel-btf", "", "specify kernel BTF file")
 	flag.StringSliceVar(&f.KMods, "kmods", nil, "list of kernel modules names to attach to")
 	flag.BoolVar(&f.AllKMods, "all-kmods", false, "attach to all available kernel modules")
 	flag.StringVar(&f.FilterFunc, "filter-func", "", "filter kernel functions to be probed by name (exact match, supports RE2 regular expression)")
-	flag.Uint32Var(&f.FilterNetns, "filter-netns", 0, "filter netns inode")
+	flag.StringVar(&f.FilterNetns, "filter-netns", "", "filter netns (\"/proc/<pid>/ns/net\", \"inode:<inode>\")")
 	flag.Uint32Var(&f.FilterMark, "filter-mark", 0, "filter skb mark")
+	flag.BoolVar(&f.FilterTrackSkb, "filter-track-skb", false, "trace a packet even if it does not match given filters (e.g., after NAT or tunnel decapsulation)")
+	flag.BoolVar(&f.FilterTraceTc, "filter-trace-tc", false, "trace TC bpf progs")
+	flag.StringVar(&f.FilterIfname, "filter-ifname", "", "filter skb ifname in --filter-netns (if not specified, use current netns)")
 	flag.StringVar(&f.OutputTS, "timestamp", "none", "print timestamp per skb (\"current\", \"relative\", \"absolute\", \"none\")")
 	flag.BoolVar(&f.OutputMeta, "output-meta", false, "print skb metadata")
 	flag.BoolVar(&f.OutputTuple, "output-tuple", false, "print L4 tuple")
 	flag.BoolVar(&f.OutputSkb, "output-skb", false, "print skb")
 	flag.BoolVar(&f.OutputStack, "output-stack", false, "print stack")
 	flag.Uint64Var(&f.OutputLimitLines, "output-limit-lines", 0, "exit the program after the number of events has been received/printed")
-	flag.BoolVar(&f.FilterTrackSkb, "filter-track-skb", false, "trace a packet even if it does not match given filters (e.g., after NAT or tunnel decapsulation)")
 
 	flag.StringVar(&f.OutputFile, "output-file", "", "write traces to file")
 
@@ -73,10 +78,14 @@ func (f *Flags) SetFlags() {
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] [pcap-filter]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "    Availble pcap-filter: see \"man 7 pcap-filter\"\n")
-		fmt.Fprintf(os.Stderr, "    Availble options:\n")
+		fmt.Fprintf(os.Stderr, "    Available pcap-filter: see \"man 7 pcap-filter\"\n")
+		fmt.Fprintf(os.Stderr, "    Available options:\n")
 		flag.PrintDefaults()
 	}
+}
+
+func (f *Flags) PrintHelp() {
+	flag.Usage()
 }
 
 func (f *Flags) Parse() {
@@ -120,28 +129,4 @@ type Event struct {
 	PrintStackId int64
 	ParamSecond  uint64
 	CPU          uint32
-}
-
-type KProbeMaps interface {
-	GetEvents() *ebpf.Map
-	GetPrintStackMap() *ebpf.Map
-}
-
-type KProbeMapsWithOutputSKB interface {
-	KProbeMaps
-	GetPrintSkbMap() *ebpf.Map
-}
-
-type KProbePrograms interface {
-	GetKprobeSkb1() *ebpf.Program
-	GetKprobeSkb2() *ebpf.Program
-	GetKprobeSkb3() *ebpf.Program
-	GetKprobeSkb4() *ebpf.Program
-	GetKprobeSkb5() *ebpf.Program
-}
-
-type KProbeObjects interface {
-	KProbeMaps
-	KProbePrograms
-	Close() error
 }
